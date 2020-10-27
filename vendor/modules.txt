@@ -1,5 +1,4 @@
 # cloud.google.com/go v0.60.0
-## explicit
 cloud.google.com/go
 cloud.google.com/go/compute/metadata
 cloud.google.com/go/iam
@@ -185,7 +184,7 @@ github.com/matttproud/golang_protobuf_extensions/pbutil
 github.com/modern-go/concurrent
 # github.com/modern-go/reflect2 v1.0.1
 github.com/modern-go/reflect2
-# github.com/openshift/ci-operator v0.0.0-20190523203517-fc248912d39f
+# github.com/openshift/ci-operator v0.0.0-20190523203517-fc248912d39f => github.com/bardielle/ci-operator v0.0.0-20201027125412-0193ff748d4f
 ## explicit
 github.com/openshift/ci-operator/pkg/api
 # github.com/peterbourgon/diskv v2.0.1+incompatible
@@ -206,8 +205,6 @@ github.com/prometheus/common/model
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/qor/inflection v0.0.0-20180308033659-04140366298a
-## explicit
 # github.com/satori/go.uuid v1.2.0
 github.com/satori/go.uuid
 # github.com/shurcooL/githubv4 v0.0.0-20191102174205-af46314aec7b
@@ -879,3 +876,4 @@ sigs.k8s.io/yaml
 # vbom.ml/util v0.0.0-20180919145318-efcd4e0f9787
 vbom.ml/util/sortorder
 # github.com/golang/lint => golang.org/x/lint v0.0.0-20190301231843-5614ed5bae6f
+# github.com/openshift/ci-operator => github.com/bardielle/ci-operator v0.0.0-20201027125412-0193ff748d4f

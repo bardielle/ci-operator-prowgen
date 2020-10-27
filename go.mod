@@ -5,13 +5,11 @@ go 1.14
 replace github.com/golang/lint => golang.org/x/lint v0.0.0-20190301231843-5614ed5bae6f
 
 require (
-	cloud.google.com/go v0.60.0 // indirect
 	cloud.google.com/go/storage v1.10.0
 	github.com/getlantern/deepcopy v0.0.0-20160317154340-7f45deb8130a
 	github.com/ghodss/yaml v1.0.0
 	github.com/mattn/go-zglob v0.0.2
 	github.com/openshift/ci-operator v0.0.0-20190523203517-fc248912d39f
-	github.com/qor/inflection v0.0.0-20180308033659-04140366298a // indirect
 	github.com/shurcooL/githubv4 v0.0.0-20191102174205-af46314aec7b
 	github.com/sirupsen/logrus v1.6.0
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d

@@ -357,6 +357,7 @@ const (
 	ClusterProfileGCPLoggingCRIO                    = "gcp-logging-crio"
 	ClusterProfileOpenStack                         = "openstack"
 	ClusterProfileVSphere                           = "vsphere"
+	ClusterProfileKubeVirt                          = "kubevirt"
 )
 
 // ClusterTestConfiguration describes a test that provisions
