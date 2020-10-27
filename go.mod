@@ -22,3 +22,5 @@ require (
 	k8s.io/client-go v11.0.1-0.20190805182717-6502b5e7b1b5+incompatible
 	k8s.io/test-infra v0.0.0-20201027131759-eaf29ea05175
 )
+
+replace github.com/openshift/ci-operator => github.com/bardielle/ci-operator v0.0.0-20201027125412-0193ff748d4f

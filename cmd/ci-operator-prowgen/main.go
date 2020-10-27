@@ -186,6 +186,8 @@ func generatePodSpecTemplate(info *config.Info, release string, test *cioperator
 		targetCloud = "openstack"
 	case cioperatorapi.ClusterProfileVSphere:
 		targetCloud = "vsphere"
+	case cioperatorapi.ClusterProfileKubeVirt:
+                targetCloud = "kubevirt"
 	}
 	clusterProfilePath := fmt.Sprintf("/usr/local/%s-cluster-profile", test.As)
 	templatePath := fmt.Sprintf("/usr/local/%s", test.As)
@@ -207,7 +209,7 @@ func generatePodSpecTemplate(info *config.Info, release string, test *cioperator
 		},
 	}
 	switch clusterProfile {
-	case cioperatorapi.ClusterProfileAWS, cioperatorapi.ClusterProfileAzure4, cioperatorapi.ClusterProfileOpenStack, cioperatorapi.ClusterProfileVSphere:
+	case cioperatorapi.ClusterProfileAWS, cioperatorapi.ClusterProfileAzure4, cioperatorapi.ClusterProfileOpenStack, cioperatorapi.ClusterProfileVSphere, cioperatorapi.ClusterProfileKubeVirt:
 	default:
 		clusterProfileVolume.VolumeSource.Projected.Sources = append(clusterProfileVolume.VolumeSource.Projected.Sources, kubeapi.VolumeProjection{
 			ConfigMap: &kubeapi.ConfigMapProjection{
