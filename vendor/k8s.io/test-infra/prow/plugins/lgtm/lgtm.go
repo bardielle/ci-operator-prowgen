@@ -23,10 +23,11 @@ import (
 	"strings"
 
 	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/util/sets"
 
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/labels"
+	"k8s.io/test-infra/prow/pkg/layeredsets"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/plugins"
 	"k8s.io/test-infra/prow/repoowners"
@@ -43,9 +44,11 @@ var (
 	configInfoReviewActsAsLgtm = `Reviews of "approve" or "request changes" act as adding or removing LGTM.`
 	configInfoStoreTreeHash    = `Squashing commits does not remove LGTM.`
 	// LGTMLabel is the name of the lgtm label applied by the lgtm plugin
-	LGTMLabel           = labels.LGTM
-	lgtmRe              = regexp.MustCompile(`(?mi)^/lgtm(?: no-issue)?\s*$`)
-	lgtmCancelRe        = regexp.MustCompile(`(?mi)^/lgtm cancel\s*$`)
+	LGTMLabel = labels.LGTM
+	// LGTMRe is the regex that matches lgtm comments
+	LGTMRe = regexp.MustCompile(`(?mi)^/lgtm(?: no-issue)?\s*$`)
+	// LGTMCancelRe is the regex that matches lgtm cancel comments
+	LGTMCancelRe        = regexp.MustCompile(`(?mi)^/lgtm cancel\s*$`)
 	removeLGTMLabelNoti = "New changes are detected. LGTM label has been removed."
 )
 
@@ -65,19 +68,10 @@ func init() {
 	plugins.RegisterReviewEventHandler(PluginName, handlePullRequestReviewEvent, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
+func helpProvider(config *plugins.Configuration, enabledRepos []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
 	configInfo := map[string]string{}
-	for _, orgRepo := range enabledRepos {
-		parts := strings.Split(orgRepo, "/")
-		var opts *plugins.Lgtm
-		switch len(parts) {
-		case 1:
-			opts = optionsForRepo(config, orgRepo, "")
-		case 2:
-			opts = optionsForRepo(config, parts[0], parts[1])
-		default:
-			return nil, fmt.Errorf("invalid repo in enabledRepos: %q", orgRepo)
-		}
+	for _, repo := range enabledRepos {
+		opts := config.LgtmFor(repo.Org, repo.Repo)
 		var isConfigured bool
 		var configInfoStrings []string
 		configInfoStrings = append(configInfoStrings, "The plugin has the following configuration:<ul>")
@@ -93,14 +87,28 @@ func helpProvider(config *plugins.Configuration, enabledRepos []string) (*plugin
 			configInfoStrings = append(configInfoStrings, "<li>"+configInfoStickyLgtmTeam(opts.StickyLgtmTeam)+"</li>")
 			isConfigured = true
 		}
-		configInfoStrings = append(configInfoStrings, fmt.Sprintf("</ul>"))
+		configInfoStrings = append(configInfoStrings, "</ul>")
 		if isConfigured {
-			configInfo[orgRepo] = strings.Join(configInfoStrings, "\n")
+			configInfo[repo.String()] = strings.Join(configInfoStrings, "\n")
 		}
+	}
+	yamlSnippet, err := plugins.CommentMap.GenYaml(&plugins.Configuration{
+		Lgtm: []plugins.Lgtm{
+			{
+				Repos:            []string{"kubernetes/test-infra"},
+				ReviewActsAsLgtm: true,
+				StickyLgtmTeam:   "team1",
+				StoreTreeHash:    true,
+			},
+		},
+	})
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot generate comments for %s plugin", PluginName)
 	}
 	pluginHelp := &pluginhelp.PluginHelp{
 		Description: "The lgtm plugin manages the application and removal of the 'lgtm' (Looks Good To Me) label which is typically used to gate merging.",
 		Config:      configInfo,
+		Snippet:     yamlSnippet,
 	}
 	pluginHelp.AddCommand(pluginhelp.Command{
 		Usage:       "/lgtm [cancel] or GitHub Review action",
@@ -110,25 +118,6 @@ func helpProvider(config *plugins.Configuration, enabledRepos []string) (*plugin
 		Examples:    []string{"/lgtm", "/lgtm cancel", "<a href=\"https://help.github.com/articles/about-pull-request-reviews/\">'Approve' or 'Request Changes'</a>"},
 	})
 	return pluginHelp, nil
-}
-
-// optionsForRepo gets the plugins.Lgtm struct that is applicable to the indicated repo.
-func optionsForRepo(config *plugins.Configuration, org, repo string) *plugins.Lgtm {
-	fullName := fmt.Sprintf("%s/%s", org, repo)
-	for _, c := range config.Lgtm {
-		if !sets.NewString(c.Repos...).Has(fullName) {
-			continue
-		}
-		return &c
-	}
-	// If you don't find anything, loop again looking for an org config
-	for _, c := range config.Lgtm {
-		if !sets.NewString(c.Repos...).Has(org) {
-			continue
-		}
-		return &c
-	}
-	return &plugins.Lgtm{}
 }
 
 type githubClient interface {
@@ -176,7 +165,7 @@ func handlePullRequestEvent(pc plugins.Agent, pre github.PullRequestEvent) error
 
 func handlePullRequestReviewEvent(pc plugins.Agent, e github.ReviewEvent) error {
 	// If ReviewActsAsLgtm is disabled, ignore review event.
-	opts := optionsForRepo(pc.PluginConfig, e.Repo.Owner.Login, e.Repo.Name)
+	opts := pc.PluginConfig.LgtmFor(e.Repo.Owner.Login, e.Repo.Name)
 	if !opts.ReviewActsAsLgtm {
 		return nil
 	}
@@ -206,9 +195,9 @@ func handleGenericComment(gc githubClient, config *plugins.Configuration, owners
 	// If we create an "/lgtm" comment, add lgtm if necessary.
 	// If we create a "/lgtm cancel" comment, remove lgtm if necessary.
 	wantLGTM := false
-	if lgtmRe.MatchString(rc.body) {
+	if LGTMRe.MatchString(rc.body) {
 		wantLGTM = true
-	} else if lgtmCancelRe.MatchString(rc.body) {
+	} else if LGTMCancelRe.MatchString(rc.body) {
 		wantLGTM = false
 	} else {
 		return nil
@@ -236,7 +225,7 @@ func handlePullRequestReview(gc githubClient, config *plugins.Configuration, own
 
 	// If the review event body contains an '/lgtm' or '/lgtm cancel' comment,
 	// skip handling the review event
-	if lgtmRe.MatchString(rc.body) || lgtmCancelRe.MatchString(rc.body) {
+	if LGTMRe.MatchString(rc.body) || LGTMCancelRe.MatchString(rc.body) {
 		return nil
 	}
 
@@ -290,27 +279,31 @@ func handle(wantLGTM bool, config *plugins.Configuration, ownersClient repoowner
 	// check if skip collaborators is enabled for this org/repo
 	skipCollaborators := skipCollaborators(config, org, repoName)
 
-	// either ensure that the commentor is a collaborator or an approver/reviwer
+	// check if the commenter is a collaborator
+	isCollaborator, err := gc.IsCollaborator(org, repoName, author)
+	if err != nil {
+		log.WithError(err).Error("Failed to check if author is a collaborator.")
+		return err // abort if we can't determine if commenter is a collaborator
+	}
+
+	// if commenter isn't a collaborator, and we care about collaborators, abort
+	if !isAuthor && !skipCollaborators && !isCollaborator {
+		resp := "changing LGTM is restricted to collaborators"
+		log.Infof("Reply to /lgtm request with comment: \"%s\"", resp)
+		return gc.CreateComment(org, repoName, number, plugins.FormatResponseRaw(body, htmlURL, author, resp))
+	}
+
+	// either ensure that the commenter is a collaborator or an approver/reviewer
 	if !isAuthor && !isAssignee && !skipCollaborators {
-		// in this case we need to ensure the commentor is assignable to the PR
+		// in this case we need to ensure the commenter is assignable to the PR
 		// by assigning them
 		log.Infof("Assigning %s/%s#%d to %s", org, repoName, number, author)
 		if err := gc.AssignIssue(org, repoName, number, []string{author}); err != nil {
-			msg := "assigning you to the PR failed"
-			if ok, merr := gc.IsCollaborator(org, repoName, author); merr == nil && !ok {
-				msg = fmt.Sprintf("only %s/%s repo collaborators may be assigned issues", org, repoName)
-			} else if merr != nil {
-				log.WithError(merr).Error("Failed to check if author is a collaborator.")
-			} else {
-				log.WithError(err).Error("Failed to assign issue to author.")
-			}
-			resp := "changing LGTM is restricted to assignees, and " + msg + "."
-			log.Infof("Reply to assign via /lgtm request with comment: \"%s\"", resp)
-			return gc.CreateComment(org, repoName, number, plugins.FormatResponseRaw(body, htmlURL, author, resp))
+			log.WithError(err).Errorf("Failed to assign %s/%s#%d to %s", org, repoName, number, author)
 		}
 	} else if !isAuthor && skipCollaborators {
 		// in this case we depend on OWNERS files instead to check if the author
-		// is an approver or reviwer of the changed files
+		// is an approver or reviewer of the changed files
 		log.Debugf("Skipping collaborator checks and loading OWNERS for %s/%s#%d", org, repoName, number)
 		ro, err := loadRepoOwners(gc, ownersClient, org, repoName, number)
 		if err != nil {
@@ -328,7 +321,7 @@ func handle(wantLGTM bool, config *plugins.Configuration, ownersClient repoowner
 	}
 
 	// now we update the LGTM labels, having checked all cases where changing
-	// LGTM was not allowed for the commentor
+	// LGTM was not allowed for the commenter
 
 	// Only add the label if it doesn't have it, and vice versa.
 	labels, err := gc.GetIssueLabels(org, repoName, number)
@@ -338,7 +331,7 @@ func handle(wantLGTM bool, config *plugins.Configuration, ownersClient repoowner
 	hasLGTM := github.HasLabel(LGTMLabel, labels)
 
 	// remove the label if necessary, we're done after this
-	opts := optionsForRepo(config, rc.repo.Owner.Login, rc.repo.Name)
+	opts := config.LgtmFor(rc.repo.Owner.Login, rc.repo.Name)
 	if hasLGTM && !wantLGTM {
 		log.Info("Removing LGTM label.")
 		if err := gc.RemoveLabel(org, repoName, number, LGTMLabel); err != nil {
@@ -418,7 +411,7 @@ func handlePullRequest(log *logrus.Entry, gc githubClient, config *plugins.Confi
 	repo := pe.PullRequest.Base.Repo.Name
 	number := pe.PullRequest.Number
 
-	opts := optionsForRepo(config, org, repo)
+	opts := config.LgtmFor(org, repo)
 	if stickyLgtm(log, gc, config, opts, pe.PullRequest.User.Login, org, repo) {
 		// If the author is trusted, skip tree hash verification and LGTM removal.
 		return nil
@@ -436,7 +429,7 @@ func handlePullRequest(log *logrus.Entry, gc githubClient, config *plugins.Confi
 	if opts.StoreTreeHash {
 		// Check if we have a tree-hash comment
 		var lastLgtmTreeHash string
-		botname, err := gc.BotName()
+		botName, err := gc.BotName()
 		if err != nil {
 			return err
 		}
@@ -449,7 +442,7 @@ func handlePullRequest(log *logrus.Entry, gc githubClient, config *plugins.Confi
 		for i := len(comments) - 1; i >= 0; i-- {
 			comment := comments[i]
 			m := addLGTMLabelNotificationRe.FindStringSubmatch(comment.Body)
-			if comment.User.Login == botname && m != nil && comment.UpdatedAt.Equal(comment.CreatedAt) {
+			if comment.User.Login == botName && m != nil && comment.UpdatedAt.Equal(comment.CreatedAt) {
 				lastLgtmTreeHash = m[1]
 				break
 			}
@@ -512,8 +505,8 @@ func getChangedFiles(gc githubClient, org, repo string, number int) ([]string, e
 
 // loadReviewers returns all reviewers and approvers from all OWNERS files that
 // cover the provided filenames.
-func loadReviewers(ro repoowners.RepoOwner, filenames []string) sets.String {
-	reviewers := sets.String{}
+func loadReviewers(ro repoowners.RepoOwner, filenames []string) layeredsets.String {
+	reviewers := layeredsets.String{}
 	for _, filename := range filenames {
 		reviewers = reviewers.Union(ro.Approvers(filename)).Union(ro.Reviewers(filename))
 	}

@@ -17,26 +17,32 @@ limitations under the License.
 package pjutil
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ktypes "k8s.io/apimachinery/pkg/types"
+	ctrlruntimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	prowapi "k8s.io/test-infra/prow/apis/prowjobs/v1"
+	reporter "k8s.io/test-infra/prow/crier/reporters/github"
 )
+
+// patchClient a minimalistic prow client required by the aborter
+type patchClient interface {
+	Patch(ctx context.Context, obj runtime.Object, patch ctrlruntimeclient.Patch, opts ...ctrlruntimeclient.PatchOption) error
+}
 
 // prowClient a minimalistic prow client required by the aborter
 type prowClient interface {
-	//ReplaceProwJob replaces the prow job with the given name
-	ReplaceProwJob(string, prowapi.ProwJob) (prowapi.ProwJob, error)
+	Patch(ctx context.Context, name string, pt ktypes.PatchType, data []byte, o metav1.PatchOptions, subresources ...string) (result *prowapi.ProwJob, err error)
 }
-
-// ProwJobResourcesCleanup type for a callback function which it is expected to clean up
-// all k8s resources associated with the given prow job. It should do the best effort to
-// remove these resources, but if for any reason there is an error, it should only log a warning
-// message.
-type ProwJobResourcesCleanup func(pj prowapi.ProwJob) error
 
 // digestRefs digests a Refs to the fields we care about
 // for termination, ensuring that permutations of pulls
@@ -50,13 +56,13 @@ func digestRefs(ref prowapi.Refs) string {
 	return fmt.Sprintf("%s/%s@%s %v", ref.Org, ref.Repo, ref.BaseRef, pulls)
 }
 
-// TerminateOlderJobs aborts all presubmit jobs from the given list that have a newer version. It calls
-// the cleanup callback for each job before updating its status as aborted.
-func TerminateOlderJobs(pjc prowClient, log *logrus.Entry, pjs []prowapi.ProwJob,
-	cleanup ProwJobResourcesCleanup) error {
+// TerminateOlderJobs aborts all presubmit jobs from the given list that have a newer version. It does not set
+// the prowjob to complete. The responsible agent is expected to react to the aborted state by aborting the actual
+// test payload and then setting the ProwJob to completed.
+func TerminateOlderJobs(pjc patchClient, log *logrus.Entry, pjs []prowapi.ProwJob) error {
 	dupes := map[string]int{}
 	for i, pj := range pjs {
-		if pj.Complete() || !(pj.Spec.Type == prowapi.PresubmitJob || pj.Spec.Type == prowapi.BatchJob) {
+		if pj.Complete() || pj.Spec.Type != prowapi.PresubmitJob {
 			continue
 		}
 
@@ -93,27 +99,46 @@ func TerminateOlderJobs(pjc prowClient, log *logrus.Entry, pjs []prowapi.ProwJob
 			dupes[ji] = i
 		}
 		toCancel := pjs[cancelIndex]
+		prevPJ := toCancel.DeepCopy()
 
-		// TODO cancel the prow job before cleaning up its resources and make this system
-		// independent.
-		// See this discussion for more details:  https://github.com/kubernetes/test-infra/pull/11451#discussion_r263523932
-		if err := cleanup(toCancel); err != nil {
-			log.WithError(err).WithFields(ProwJobFields(&toCancel)).Warn("Cannot clean up job resources")
-		}
-
-		toCancel.SetComplete()
-		prevState := toCancel.Status.State
 		toCancel.Status.State = prowapi.AbortedState
+		if toCancel.Status.PrevReportStates == nil {
+			toCancel.Status.PrevReportStates = map[string]prowapi.ProwJobState{}
+		}
+		toCancel.Status.PrevReportStates[reporter.GitHubReporterName] = toCancel.Status.State
+
 		log.WithFields(ProwJobFields(&toCancel)).
-			WithField("from", prevState).
+			WithField("from", prevPJ.Status.State).
 			WithField("to", toCancel.Status.State).Info("Transitioning states")
 
-		npj, err := pjc.ReplaceProwJob(toCancel.ObjectMeta.Name, toCancel)
-		if err != nil {
+		if err := pjc.Patch(context.Background(), &toCancel, ctrlruntimeclient.MergeFrom(prevPJ)); err != nil {
 			return err
 		}
-		pjs[cancelIndex] = npj
+
+		// Update the cancelled jobs entry in pjs.
+		pjs[cancelIndex] = toCancel
 	}
 
 	return nil
+}
+
+func PatchProwjob(ctx context.Context, pjc prowClient, log *logrus.Entry, srcPJ prowapi.ProwJob, destPJ prowapi.ProwJob) (*prowapi.ProwJob, error) {
+	srcPJData, err := json.Marshal(srcPJ)
+	if err != nil {
+		return nil, fmt.Errorf("marshal source prow job: %v", err)
+	}
+
+	destPJData, err := json.Marshal(destPJ)
+	if err != nil {
+		return nil, fmt.Errorf("marshal dest prow job: %v", err)
+	}
+
+	patch, err := jsonpatch.CreateMergePatch(srcPJData, destPJData)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create JSON patch: %v", err)
+	}
+
+	newPJ, err := pjc.Patch(ctx, srcPJ.Name, ktypes.MergePatchType, patch, metav1.PatchOptions{})
+	log.WithFields(ProwJobFields(&destPJ)).Debug("Patched ProwJob.")
+	return newPJ, err
 }

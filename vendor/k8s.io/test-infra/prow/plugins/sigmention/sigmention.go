@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/sirupsen/logrus"
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/labels"
 	"k8s.io/test-infra/prow/pluginhelp"
@@ -58,7 +59,15 @@ func init() {
 	plugins.RegisterGenericCommentHandler(pluginName, handleGenericComment, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
+func helpProvider(config *plugins.Configuration, _ []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
+	yamlSnippet, err := plugins.CommentMap.GenYaml(&plugins.Configuration{
+		SigMention: plugins.SigMention{
+			Regexp: "(?m)@kubernetes/sig-([\\w-]*)-(misc|test-failures|bugs|feature-requests|proposals|pr-reviews|api-reviews)",
+		},
+	})
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot generate comments for %s plugin", pluginName)
+	}
 	return &pluginhelp.PluginHelp{
 			Description: `The sigmention plugin responds to SIG (Special Interest Group) GitHub team mentions like '@kubernetes/sig-testing-bugs'. The plugin responds in two ways:
 <ol><li> The appropriate 'sig/*' and 'kind/*' labels are applied to the issue or pull request. In this case 'sig/testing' and 'kind/bug'.</li>
@@ -66,6 +75,7 @@ func helpProvider(config *plugins.Configuration, enabledRepos []string) (*plugin
 			Config: map[string]string{
 				"": fmt.Sprintf("Labels added by the plugin are triggered by mentions of GitHub teams matching the following regexp:\n%s", config.SigMention.Regexp),
 			},
+			Snippet: yamlSnippet,
 		},
 		nil
 }

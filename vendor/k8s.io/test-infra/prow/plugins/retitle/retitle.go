@@ -19,12 +19,15 @@ package retitle
 
 import (
 	"regexp"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/github"
 	"k8s.io/test-infra/prow/pluginhelp"
 	"k8s.io/test-infra/prow/plugins"
+	"k8s.io/test-infra/prow/plugins/invalidcommitmsg"
 	"k8s.io/test-infra/prow/plugins/trigger"
 )
 
@@ -41,10 +44,27 @@ func init() {
 	plugins.RegisterGenericCommentHandler(pluginName, handleGenericCommentEvent, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
-	// The Config field is omitted because this plugin is not configurable.
+func helpProvider(config *plugins.Configuration, _ []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
+	var configMsg string
+	if config.Retitle.AllowClosedIssues {
+		configMsg = "The retitle plugin also allows retitling closed/merged issues and PRs."
+	} else {
+		configMsg = "The retitle plugin does not allow retitling closed/merged issues and PRs."
+	}
+	yamlSnippet, err := plugins.CommentMap.GenYaml(&plugins.Configuration{
+		Retitle: plugins.Retitle{
+			AllowClosedIssues: true,
+		},
+	})
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot generate comments for %s plugin", pluginName)
+	}
 	pluginHelp := &pluginhelp.PluginHelp{
 		Description: "The retitle plugin allows users to re-title pull requests and issues where GitHub permissions don't allow them to.",
+		Config: map[string]string{
+			"": configMsg,
+		},
+		Snippet: yamlSnippet,
 	}
 	pluginHelp.AddCommand(pluginhelp.Command{
 		Usage:       "/retitle <title>",
@@ -62,8 +82,10 @@ func handleGenericCommentEvent(pc plugins.Agent, e github.GenericCommentEvent) e
 		repo = e.Repo.Name
 	)
 	return handleGenericComment(pc.GitHubClient, func(user string) (bool, error) {
-		return trigger.TrustedUser(pc.GitHubClient, pc.PluginConfig.TriggerFor(org, repo), user, org, repo)
-	}, pc.Logger, e)
+		t := pc.PluginConfig.TriggerFor(org, repo)
+		trustedResponse, err := trigger.TrustedUser(pc.GitHubClient, t.OnlyOrgMembers, t.TrustedOrg, user, org, repo)
+		return trustedResponse.IsTrusted, err
+	}, pc.PluginConfig.Retitle.AllowClosedIssues, pc.Logger, e)
 }
 
 type githubClient interface {
@@ -74,9 +96,15 @@ type githubClient interface {
 	EditIssue(org, repo string, number int, issue *github.Issue) (*github.Issue, error)
 }
 
-func handleGenericComment(gc githubClient, isTrusted func(string) (bool, error), log *logrus.Entry, gce github.GenericCommentEvent) error {
-	// Only consider open PRs and issues, and new comments.
-	if gce.IssueState != "open" || gce.Action != github.GenericCommentActionCreated {
+func handleGenericComment(gc githubClient, isTrusted func(string) (bool, error), allowClosedIssues bool, log *logrus.Entry, gce github.GenericCommentEvent) error {
+	// If closed/merged issues and PRs shouldn't be considered,
+	// return early if issue state is not open.
+	if !allowClosedIssues && gce.IssueState != "open" {
+		return nil
+	}
+
+	// Only consider new comments.
+	if gce.Action != github.GenericCommentActionCreated {
 		return nil
 	}
 
@@ -106,9 +134,13 @@ func handleGenericComment(gc githubClient, isTrusted func(string) (bool, error),
 		// this shouldn't happen since we checked above
 		return nil
 	}
-	newTitle := matches[1]
+	newTitle := strings.TrimSpace(matches[1])
 	if newTitle == "" {
 		return gc.CreateComment(org, repo, number, plugins.FormatResponseRaw(gce.Body, gce.HTMLURL, user, `Titles may not be empty.`))
+	}
+
+	if invalidcommitmsg.AtMentionRegex.MatchString(newTitle) || invalidcommitmsg.CloseIssueRegex.MatchString(newTitle) {
+		return gc.CreateComment(org, repo, number, plugins.FormatResponseRaw(gce.Body, gce.HTMLURL, user, `Titles may not contain [keywords](https://help.github.com/articles/closing-issues-using-keywords) which can automatically close issues and at(@) mentions.`))
 	}
 
 	if gce.IsPR {
@@ -119,13 +151,12 @@ func handleGenericComment(gc githubClient, isTrusted func(string) (bool, error),
 		pr.Title = newTitle
 		_, err = gc.EditPullRequest(org, repo, number, pr)
 		return err
-	} else {
-		issue, err := gc.GetIssue(org, repo, number)
-		if err != nil {
-			return err
-		}
-		issue.Title = newTitle
-		_, err = gc.EditIssue(org, repo, number, issue)
+	}
+	issue, err := gc.GetIssue(org, repo, number)
+	if err != nil {
 		return err
 	}
+	issue.Title = newTitle
+	_, err = gc.EditIssue(org, repo, number, issue)
+	return err
 }

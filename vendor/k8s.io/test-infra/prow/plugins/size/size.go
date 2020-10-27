@@ -25,6 +25,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"k8s.io/test-infra/prow/config"
 	"k8s.io/test-infra/prow/genfiles"
 	"k8s.io/test-infra/prow/gitattributes"
 	"k8s.io/test-infra/prow/github"
@@ -48,8 +49,20 @@ func init() {
 	plugins.RegisterPullRequestHandler(pluginName, handlePullRequest, helpProvider)
 }
 
-func helpProvider(config *plugins.Configuration, enabledRepos []string) (*pluginhelp.PluginHelp, error) {
+func helpProvider(config *plugins.Configuration, _ []config.OrgRepo) (*pluginhelp.PluginHelp, error) {
 	sizes := sizesOrDefault(config.Size)
+	yamlSnippet, err := plugins.CommentMap.GenYaml(&plugins.Configuration{
+		Size: plugins.Size{
+			S:   10,
+			M:   30,
+			L:   100,
+			Xl:  500,
+			Xxl: 1000,
+		},
+	})
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot generate comments for %s plugin", pluginName)
+	}
 	return &pluginhelp.PluginHelp{
 			Description: "The size plugin manages the 'size/*' labels, maintaining the appropriate label on each pull request as it is updated. Generated files identified by the config file '.generated_files' at the repo root are ignored. Labels are applied based on the total number of lines of changes (additions and deletions).",
 			Config: map[string]string{
@@ -62,6 +75,7 @@ func helpProvider(config *plugins.Configuration, enabledRepos []string) (*plugin
 <li>size/XXL: %d+</li>
 </ul>`, sizes.S-1, sizes.S, sizes.M-1, sizes.M, sizes.L-1, sizes.L, sizes.Xl-1, sizes.Xl, sizes.Xxl-1, sizes.Xxl),
 			},
+			Snippet: yamlSnippet,
 		},
 		nil
 }
@@ -169,13 +183,13 @@ const (
 const (
 	labelPrefix = "size/"
 
-	labelXS     = "size/XS"
-	labelS      = "size/S"
-	labelM      = "size/M"
-	labelL      = "size/L"
-	labelXL     = "size/XL"
-	labelXXL    = "size/XXL"
-	labelUnkown = "size/?"
+	labelXS      = "size/XS"
+	labelS       = "size/S"
+	labelM       = "size/M"
+	labelL       = "size/L"
+	labelXL      = "size/XL"
+	labelXXL     = "size/XXL"
+	labelUnknown = "size/?"
 )
 
 func (s size) label() string {
@@ -194,7 +208,7 @@ func (s size) label() string {
 		return labelXXL
 	}
 
-	return labelUnkown
+	return labelUnknown
 }
 
 func bucket(lineCount int, sizes plugins.Size) size {

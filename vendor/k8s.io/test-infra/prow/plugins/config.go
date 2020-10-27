@@ -17,18 +17,25 @@ limitations under the License.
 package plugins
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+
+	"k8s.io/test-infra/prow/bugzilla"
+	"k8s.io/test-infra/prow/kube"
 	"k8s.io/test-infra/prow/labels"
+	"k8s.io/test-infra/prow/logrusutil"
 )
 
 const (
@@ -52,28 +59,35 @@ type Configuration struct {
 	Owners Owners `json:"owners,omitempty"`
 
 	// Built-in plugins specific configuration.
-	Approve                    []Approve              `json:"approve,omitempty"`
-	UseDeprecatedSelfApprove   bool                   `json:"use_deprecated_2018_implicit_self_approve_default_migrate_before_july_2019,omitempty"`
-	UseDeprecatedReviewApprove bool                   `json:"use_deprecated_2018_review_acts_as_approve_default_migrate_before_july_2019,omitempty"`
-	Blockades                  []Blockade             `json:"blockades,omitempty"`
-	Blunderbuss                Blunderbuss            `json:"blunderbuss,omitempty"`
-	Bugzilla                   Bugzilla               `json:"bugzilla"`
-	Cat                        Cat                    `json:"cat,omitempty"`
-	CherryPickUnapproved       CherryPickUnapproved   `json:"cherry_pick_unapproved,omitempty"`
-	ConfigUpdater              ConfigUpdater          `json:"config_updater,omitempty"`
-	Golint                     Golint                 `json:"golint"`
-	Heart                      Heart                  `json:"heart,omitempty"`
-	Label                      Label                  `json:"label"`
-	Lgtm                       []Lgtm                 `json:"lgtm,omitempty"`
-	RepoMilestone              map[string]Milestone   `json:"repo_milestone,omitempty"`
-	Project                    ProjectConfig          `json:"project_config,omitempty"`
-	RequireMatchingLabel       []RequireMatchingLabel `json:"require_matching_label,omitempty"`
-	RequireSIG                 RequireSIG             `json:"requiresig,omitempty"`
-	Slack                      Slack                  `json:"slack,omitempty"`
-	SigMention                 SigMention             `json:"sigmention,omitempty"`
-	Size                       Size                   `json:"size"`
-	Triggers                   []Trigger              `json:"triggers,omitempty"`
-	Welcome                    []Welcome              `json:"welcome,omitempty"`
+
+	Approve                    []Approve                    `json:"approve,omitempty"`
+	UseDeprecatedSelfApprove   bool                         `json:"use_deprecated_2018_implicit_self_approve_default_migrate_before_july_2019,omitempty"`
+	UseDeprecatedReviewApprove bool                         `json:"use_deprecated_2018_review_acts_as_approve_default_migrate_before_july_2019,omitempty"`
+	Blockades                  []Blockade                   `json:"blockades,omitempty"`
+	Blunderbuss                Blunderbuss                  `json:"blunderbuss,omitempty"`
+	Bugzilla                   Bugzilla                     `json:"bugzilla,omitempty"`
+	Cat                        Cat                          `json:"cat,omitempty"`
+	CherryPickUnapproved       CherryPickUnapproved         `json:"cherry_pick_unapproved,omitempty"`
+	ConfigUpdater              ConfigUpdater                `json:"config_updater,omitempty"`
+	Dco                        map[string]*Dco              `json:"dco,omitempty"`
+	Golint                     Golint                       `json:"golint,omitempty"`
+	Goose                      Goose                        `json:"goose,omitempty"`
+	Heart                      Heart                        `json:"heart,omitempty"`
+	Label                      Label                        `json:"label,omitempty"`
+	Lgtm                       []Lgtm                       `json:"lgtm,omitempty"`
+	MilestoneApplier           map[string]BranchToMilestone `json:"milestone_applier,omitempty"`
+	RepoMilestone              map[string]Milestone         `json:"repo_milestone,omitempty"`
+	Project                    ProjectConfig                `json:"project_config,omitempty"`
+	ProjectManager             ProjectManager               `json:"project_manager,omitempty"`
+	RequireMatchingLabel       []RequireMatchingLabel       `json:"require_matching_label,omitempty"`
+	RequireSIG                 RequireSIG                   `json:"requiresig,omitempty"`
+	Retitle                    Retitle                      `json:"retitle,omitempty"`
+	Slack                      Slack                        `json:"slack,omitempty"`
+	SigMention                 SigMention                   `json:"sigmention,omitempty"`
+	Size                       Size                         `json:"size,omitempty"`
+	Triggers                   []Trigger                    `json:"triggers,omitempty"`
+	Welcome                    []Welcome                    `json:"welcome,omitempty"`
+	Override                   Override                     `json:"override,omitempty"`
 }
 
 // Golint holds configuration for the golint plugin
@@ -102,15 +116,10 @@ type ExternalPlugin struct {
 type Blunderbuss struct {
 	// ReviewerCount is the minimum number of reviewers to request
 	// reviews from. Defaults to requesting reviews from 2 reviewers
-	// if FileWeightCount is not set.
 	ReviewerCount *int `json:"request_count,omitempty"`
 	// MaxReviewerCount is the maximum number of reviewers to request
 	// reviews from. Defaults to 0 meaning no limit.
 	MaxReviewerCount int `json:"max_request_count,omitempty"`
-	// FileWeightCount is the maximum number of reviewers to request
-	// reviews from. Selects reviewers based on file weighting.
-	// This and request_count are mutually exclusive options.
-	FileWeightCount *int `json:"file_weight_count,omitempty"`
 	// ExcludeApprovers controls whether approvers are considered to be
 	// reviewers. By default, approvers are considered as reviewers if
 	// insufficient reviewers are available. If ExcludeApprovers is true,
@@ -182,6 +191,12 @@ type RequireSIG struct {
 	GroupListURL string `json:"group_list_url,omitempty"`
 }
 
+// Retitle specifies configuration for the retitle plugin.
+type Retitle struct {
+	// AllowClosedIssues allows retitling closed/merged issues and PRs.
+	AllowClosedIssues bool `json:"allow_closed_issues,omitempty"`
+}
+
 // SigMention specifies configuration for the sigmention plugin.
 type SigMention struct {
 	// Regexp parses comments and should return matches to team mentions.
@@ -238,8 +253,6 @@ type Approve struct {
 	// the specified repos.
 	IssueRequired bool `json:"issue_required,omitempty"`
 
-	// TODO(fejta): delete in June 2019
-	DeprecatedImplicitSelfApprove *bool `json:"implicit_self_approve,omitempty"`
 	// RequireSelfApproval requires PR authors to explicitly approve their PRs.
 	// Otherwise the plugin assumes the author of the PR approves the changes in the PR.
 	RequireSelfApproval *bool `json:"require_self_approval,omitempty"`
@@ -248,35 +261,34 @@ type Approve struct {
 	// indicate approval
 	LgtmActsAsApprove bool `json:"lgtm_acts_as_approve,omitempty"`
 
-	// ReviewActsAsApprove should be replaced with its non-deprecated inverse: ignore_review_state.
-	// TODO(fejta): delete in June 2019
-	DeprecatedReviewActsAsApprove *bool `json:"review_acts_as_approve,omitempty"`
 	// IgnoreReviewState causes the approve plugin to ignore the GitHub review state. Otherwise:
 	// * an APPROVE github review is equivalent to leaving an "/approve" message.
 	// * A REQUEST_CHANGES github review is equivalent to leaving an /approve cancel" message.
 	IgnoreReviewState *bool `json:"ignore_review_state,omitempty"`
+
+	// CommandHelpLink is the link to the help page which shows the available commands for each repo.
+	// The default value is "https://go.k8s.io/bot-commands". The command help page is served by Deck
+	// and available under https://<deck-url>/command-help, e.g. "https://prow.k8s.io/command-help"
+	CommandHelpLink string `json:"commandHelpLink"`
+
+	// PrProcessLink is the link to the help page which explains the code review process.
+	// The default value is "https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process".
+	PrProcessLink string `json:"pr_process_link,omitempty"`
 }
 
 var (
-	warnImplicitSelfApprove time.Time
-	warnReviewActsAsApprove time.Time
+	warnDependentBugTargetRelease time.Time
 )
 
 func (a Approve) HasSelfApproval() bool {
-	if a.DeprecatedImplicitSelfApprove != nil {
-		warnDeprecated(&warnImplicitSelfApprove, 5*time.Minute, "Please update plugins.yaml to use require_self_approval instead of the deprecated implicit_self_approve before June 2019")
-		return *a.DeprecatedImplicitSelfApprove
-	} else if a.RequireSelfApproval != nil {
+	if a.RequireSelfApproval != nil {
 		return !*a.RequireSelfApproval
 	}
 	return true
 }
 
 func (a Approve) ConsiderReviewState() bool {
-	if a.DeprecatedReviewActsAsApprove != nil {
-		warnDeprecated(&warnReviewActsAsApprove, 5*time.Minute, "Please update plugins.yaml to use ignore_review_state instead of the deprecated review_acts_as_approve before June 2019")
-		return *a.DeprecatedReviewActsAsApprove
-	} else if a.IgnoreReviewState != nil {
+	if a.IgnoreReviewState != nil {
 		return !*a.IgnoreReviewState
 	}
 	return true
@@ -307,6 +319,12 @@ type Cat struct {
 	KeyPath string `json:"key_path,omitempty"`
 }
 
+// Goose contains the configuration for the goose plugin.
+type Goose struct {
+	// Path to file containing an api key for unsplash.com
+	KeyPath string `json:"key_path,omitempty"`
+}
+
 // Label contains the configuration for the label plugin.
 type Label struct {
 	// AdditionalLabels is a set of additional labels enabled for use
@@ -320,8 +338,11 @@ type Label struct {
 type Trigger struct {
 	// Repos is either of the form org/repos or just org.
 	Repos []string `json:"repos,omitempty"`
-	// TrustedOrg is the org whose members' PRs will be automatically built
-	// for PRs to the above repos. The default is the PR's org.
+	// TrustedOrg is the org whose members' PRs will be automatically built for
+	// PRs to the above repos. The default is the PR's org.
+	//
+	// Deprecated: TrustedOrg functionality is deprecated and will be removed in
+	// January 2020.
 	TrustedOrg string `json:"trusted_org,omitempty"`
 	// JoinOrgURL is a link that redirects users to a location where they
 	// should be able to read more about joining the organization in order
@@ -333,9 +354,6 @@ type Trigger struct {
 	// IgnoreOkToTest makes trigger ignore /ok-to-test comments.
 	// This is a security mitigation to only allow testing from trusted users.
 	IgnoreOkToTest bool `json:"ignore_ok_to_test,omitempty"`
-	// ElideSkippedContexts makes trigger not post "Skipped" contexts for jobs
-	// that could run but do not run.
-	ElideSkippedContexts bool `json:"elide_skipped_contexts,omitempty"`
 }
 
 // Heart contains the configuration for the heart plugin.
@@ -364,6 +382,10 @@ type Milestone struct {
 	MaintainersFriendlyName string `json:"maintainers_friendly_name,omitempty"`
 }
 
+// BranchToMilestone is a map of the branch name to the configured milestone for that branch.
+// This is used by the milestoneapplier plugin.
+type BranchToMilestone map[string]string
+
 // Slack contains the configuration for the slack plugin.
 type Slack struct {
 	MentionChannels []string       `json:"mentionchannels,omitempty"`
@@ -390,30 +412,83 @@ type ConfigMapSpec struct {
 	GZIP *bool `json:"gzip,omitempty"`
 	// Namespaces is the fully resolved list of Namespaces to deploy the ConfigMap in
 	Namespaces []string `json:"-"`
+	// Clusters is a map from cluster to namespaces
+	// which specifies the targets the configMap needs to be deployed, i.e., each namespace in map[cluster]
+	Clusters map[string][]string `json:"clusters"`
+	// ClusterGroup is a list of named cluster_groups to target. Mutually exclusive with clusters.
+	ClusterGroups []string `json:"cluster_groups,omitempty"`
+}
+
+// A ClusterGroup is a list of clusters with namespaces
+type ClusterGroup struct {
+	Clusters   []string `json:"clusters,omitempty"`
+	Namespaces []string `json:"namespaces,omitempty"`
 }
 
 // ConfigUpdater contains the configuration for the config-updater plugin.
 type ConfigUpdater struct {
+	// ClusterGroups is a map of ClusterGroups that can be used as a target
+	// in the map config.
+	ClusterGroups map[string]ClusterGroup `json:"cluster_groups,omitempty"`
 	// A map of filename => ConfigMapSpec.
 	// Whenever a commit changes filename, prow will update the corresponding configmap.
 	// map[string]ConfigMapSpec{ "/my/path.yaml": {Name: "foo", Namespace: "otherNamespace" }}
 	// will result in replacing the foo configmap whenever path.yaml changes
 	Maps map[string]ConfigMapSpec `json:"maps,omitempty"`
-	// The location of the prow configuration file inside the repository
-	// where the config-updater plugin is enabled. This needs to be relative
-	// to the root of the repository, eg. "prow/config.yaml" will match
-	// github.com/kubernetes/test-infra/prow/config.yaml assuming the config-updater
-	// plugin is enabled for kubernetes/test-infra. Defaults to "prow/config.yaml".
-	ConfigFile string `json:"config_file,omitempty"`
-	// The location of the prow plugin configuration file inside the repository
-	// where the config-updater plugin is enabled. This needs to be relative
-	// to the root of the repository, eg. "prow/plugins.yaml" will match
-	// github.com/kubernetes/test-infra/prow/plugins.yaml assuming the config-updater
-	// plugin is enabled for kubernetes/test-infra. Defaults to "prow/plugins.yaml".
-	PluginFile string `json:"plugin_file,omitempty"`
 	// If GZIP is true then files will be gzipped before insertion into
 	// their corresponding configmap
 	GZIP bool `json:"gzip"`
+}
+
+type configUpdatedWithoutUnmarshaler ConfigUpdater
+
+func (cu *ConfigUpdater) UnmarshalJSON(d []byte) error {
+	var target configUpdatedWithoutUnmarshaler
+	if err := json.Unmarshal(d, &target); err != nil {
+		return err
+	}
+	*cu = ConfigUpdater(target)
+	return cu.resolve()
+}
+
+func (cu *ConfigUpdater) resolve() error {
+	var errs []error
+	for k, v := range cu.Maps {
+		if len(v.Clusters) > 0 && len(v.ClusterGroups) > 0 {
+			errs = append(errs, fmt.Errorf("item maps.%s contains both clusters and cluster_groups", k))
+			continue
+		}
+
+		if len(v.Clusters) > 0 {
+			continue
+		}
+
+		clusters := map[string][]string{}
+		for idx, clusterGroupName := range v.ClusterGroups {
+			clusterGroup, hasClusterGroup := cu.ClusterGroups[clusterGroupName]
+			if !hasClusterGroup {
+				errs = append(errs, fmt.Errorf("item maps.%s.cluster_groups.%d references inexistent cluster group named %s", k, idx, clusterGroupName))
+				continue
+			}
+			for _, cluster := range clusterGroup.Clusters {
+				clusters[cluster] = append(clusters[cluster], clusterGroup.Namespaces...)
+			}
+		}
+
+		cu.Maps[k] = ConfigMapSpec{
+			Name:                 v.Name,
+			Key:                  v.Key,
+			Namespace:            v.Namespace,
+			AdditionalNamespaces: v.AdditionalNamespaces,
+			GZIP:                 v.GZIP,
+			Namespaces:           v.Namespaces,
+			Clusters:             clusters,
+		}
+	}
+
+	cu.ClusterGroups = nil
+
+	return utilerrors.NewAggregate(errs)
 }
 
 // ProjectConfig contains the configuration options for the project plugin
@@ -443,6 +518,39 @@ type ProjectRepoConfig struct {
 	ProjectColumnMap map[string]string `json:"repo_default_column_map,omitempty"`
 }
 
+// ProjectManager represents the config for the ProjectManager plugin, holding top
+// level config options, configuration is a hierarchial structure with top level element
+// being org or org/repo with the list of projects as its children
+type ProjectManager struct {
+	OrgRepos map[string]ManagedOrgRepo `json:"orgsRepos,omitempty"`
+}
+
+// ManagedOrgRepo is used by the ProjectManager plugin to represent an Organisation
+// or Repository with a list of Projects
+type ManagedOrgRepo struct {
+	Projects map[string]ManagedProject `json:"projects,omitempty"`
+}
+
+// ManagedProject is used by the ProjectManager plugin to represent a Project
+// with a list of Columns
+type ManagedProject struct {
+	Columns []ManagedColumn `json:"columns,omitempty"`
+}
+
+// ManagedColumn is used by the ProjectQueries plugin to represent a project column
+// and the conditions to add a PR to that column
+type ManagedColumn struct {
+	// Either of ID or Name should be specified
+	ID   *int   `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	// State must be open, closed or all
+	State string `json:"state,omitempty"`
+	// all the labels here should match to the incoming event to be bale to add the card to the project
+	Labels []string `json:"labels,omitempty"`
+	// Configuration is effective is the issue events repo/Owner/Login matched the org
+	Org string `json:"org,omitempty"`
+}
+
 // MergeWarning is a config for the slackevents plugin's manual merge warnings.
 // If a PR is pushed to any of the repos listed in the config then send messages
 // to the all the slack channels listed if pusher is NOT in the whitelist.
@@ -451,10 +559,14 @@ type MergeWarning struct {
 	Repos []string `json:"repos,omitempty"`
 	// List of channels on which a event is published.
 	Channels []string `json:"channels,omitempty"`
-	// A slack event is published if the user is not part of the WhiteList.
+	// Deprecated: Use ExemptUsers instead.
 	WhiteList []string `json:"whitelist,omitempty"`
-	// A slack event is published if the user is not on the branch whitelist
+	// A slack event is published if the user is not part of the ExemptUsers.
+	ExemptUsers []string `json:"exempt_users,omitempty"`
+	// Deprecated: Use ExemptBranches instead.
 	BranchWhiteList map[string][]string `json:"branch_whitelist,omitempty"`
+	// A slack event is published if the user is not on the exempt branches.
+	ExemptBranches map[string][]string `json:"exempt_branches,omitempty"`
 }
 
 // Welcome is config for the welcome plugin.
@@ -464,6 +576,17 @@ type Welcome struct {
 	// MessageTemplate is the welcome message template to post on new-contributor PRs
 	// For the info struct see prow/plugins/welcome/welcome.go's PRInfo
 	MessageTemplate string `json:"message_template,omitempty"`
+}
+
+// Dco is config for the DCO (https://developercertificate.org/) checker plugin.
+type Dco struct {
+	// SkipDCOCheckForMembers is used to skip DCO check for trusted org members
+	SkipDCOCheckForMembers bool `json:"skip_dco_check_for_members,omitempty"`
+	// TrustedOrg is the org whose members' commits will not be checked for DCO signoff
+	// if the skip DCO option is enabled. The default is the PR's org.
+	TrustedOrg string `json:"trusted_org,omitempty"`
+	// SkipDCOCheckForCollaborators is used to skip DCO check for trusted org members
+	SkipDCOCheckForCollaborators bool `json:"skip_dco_check_for_collaborators,omitempty"`
 }
 
 // CherryPickUnapproved is the config for the cherrypick-unapproved plugin.
@@ -551,29 +674,6 @@ func (r RequireMatchingLabel) validate() error {
 	return nil
 }
 
-var warnLock sync.RWMutex // Rare updates and concurrent readers, so reuse the same lock
-
-// warnDeprecated prints a deprecation warning for a particular configuration
-// option.
-func warnDeprecated(last *time.Time, freq time.Duration, msg string) {
-	// have we warned within the last freq?
-	warnLock.RLock()
-	fresh := time.Now().Sub(*last) <= freq
-	warnLock.RUnlock()
-	if fresh { // we've warned recently
-		return
-	}
-	// Warning is stale, will we win the race to warn?
-	warnLock.Lock()
-	defer warnLock.Unlock()
-	now := time.Now()           // Recalculate now, we might wait awhile for the lock
-	if now.Sub(*last) <= freq { // Nope, we lost
-		return
-	}
-	*last = now
-	logrus.Warn(msg)
-}
-
 // Describe generates a human readable description of the behavior that this
 // configuration specifies.
 func (r RequireMatchingLabel) Describe() string {
@@ -607,18 +707,99 @@ func (r RequireMatchingLabel) Describe() string {
 	return str.String()
 }
 
+// ApproveFor finds the Approve for a repo, if one exists.
+// Approval configuration can be listed for a repository
+// or an organization.
+func (c *Configuration) ApproveFor(org, repo string) *Approve {
+	fullName := fmt.Sprintf("%s/%s", org, repo)
+
+	a := func() *Approve {
+		// First search for repo config
+		for _, approve := range c.Approve {
+			if !sets.NewString(approve.Repos...).Has(fullName) {
+				continue
+			}
+			return &approve
+		}
+
+		// If you don't find anything, loop again looking for an org config
+		for _, approve := range c.Approve {
+			if !sets.NewString(approve.Repos...).Has(org) {
+				continue
+			}
+			return &approve
+		}
+
+		// Return an empty config, and use plugin defaults
+		return &Approve{}
+	}()
+	if a.CommandHelpLink == "" {
+		a.CommandHelpLink = "https://go.k8s.io/bot-commands"
+	}
+	if a.PrProcessLink == "" {
+		a.PrProcessLink = "https://git.k8s.io/community/contributors/guide/owners.md#the-code-review-process"
+	}
+	return a
+}
+
+// LgtmFor finds the Lgtm for a repo, if one exists
+// a trigger can be listed for the repo itself or for the
+// owning organization
+func (c *Configuration) LgtmFor(org, repo string) *Lgtm {
+	fullName := fmt.Sprintf("%s/%s", org, repo)
+	for _, lgtm := range c.Lgtm {
+		if !sets.NewString(lgtm.Repos...).Has(fullName) {
+			continue
+		}
+		return &lgtm
+	}
+	// If you don't find anything, loop again looking for an org config
+	for _, lgtm := range c.Lgtm {
+		if !sets.NewString(lgtm.Repos...).Has(org) {
+			continue
+		}
+		return &lgtm
+	}
+	return &Lgtm{}
+}
+
 // TriggerFor finds the Trigger for a repo, if one exists
 // a trigger can be listed for the repo itself or for the
 // owning organization
 func (c *Configuration) TriggerFor(org, repo string) Trigger {
+	orgRepo := fmt.Sprintf("%s/%s", org, repo)
 	for _, tr := range c.Triggers {
 		for _, r := range tr.Repos {
-			if r == org || r == fmt.Sprintf("%s/%s", org, repo) {
+			if r == org || r == orgRepo {
 				return tr
 			}
 		}
 	}
-	return Trigger{}
+	var tr Trigger
+	tr.SetDefaults()
+	return tr
+}
+
+func (t *Trigger) SetDefaults() {
+	if t.TrustedOrg != "" && t.JoinOrgURL == "" {
+		t.JoinOrgURL = fmt.Sprintf("https://github.com/orgs/%s/people", t.TrustedOrg)
+	}
+}
+
+// DcoFor finds the Dco for a repo, if one exists
+// a Dco can be listed for the repo itself or for the
+// owning organization
+func (c *Configuration) DcoFor(org, repo string) *Dco {
+	if c.Dco[fmt.Sprintf("%s/%s", org, repo)] != nil {
+		return c.Dco[fmt.Sprintf("%s/%s", org, repo)]
+	}
+	if c.Dco[org] != nil {
+		return c.Dco[org]
+	}
+	if c.Dco["*"] != nil {
+		return c.Dco["*"]
+	}
+	return &Dco{}
 }
 
 // EnabledReposForPlugin returns the orgs and repos that have enabled the passed plugin.
@@ -667,30 +848,26 @@ func (c *Configuration) EnabledReposForExternalPlugin(plugin string) (orgs, repo
 // SetDefaults sets default options for config updating
 func (c *ConfigUpdater) SetDefaults() {
 	if len(c.Maps) == 0 {
-		cf := c.ConfigFile
-		if cf == "" {
-			cf = "prow/config.yaml"
-		} else {
-			logrus.Warnf(`config_file is deprecated, please switch to "maps": {"%s": "config"} before July 2018`, cf)
-		}
-		pf := c.PluginFile
-		if pf == "" {
-			pf = "prow/plugins.yaml"
-		} else {
-			logrus.Warnf(`plugin_file is deprecated, please switch to "maps": {"%s": "plugins"} before July 2018`, pf)
-		}
 		c.Maps = map[string]ConfigMapSpec{
-			cf: {
+			"config/prow/config.yaml": {
 				Name: "config",
 			},
-			pf: {
+			"config/prow/plugins.yaml": {
 				Name: "plugins",
 			},
 		}
 	}
 
 	for name, spec := range c.Maps {
+		if spec.Namespace != "" || len(spec.AdditionalNamespaces) > 0 {
+			logrus.Warn("'namespace' and 'additional_namespaces' are deprecated for config-updater plugin and will be removed in October, 2020, use 'clusters' instead")
+		}
+		// as a result, namespaces will never be an empty slice (namespace in the slice could be empty string)
+		// and clusters will never be an empty map (map[cluster] could be am empty slice)
 		spec.Namespaces = append([]string{spec.Namespace}, spec.AdditionalNamespaces...)
+		if len(spec.Clusters) == 0 {
+			spec.Clusters = map[string][]string{kube.DefaultClusterAlias: spec.Namespaces}
+		}
 		c.Maps[name] = spec
 	}
 }
@@ -706,15 +883,12 @@ func (c *Configuration) setDefaults() {
 			c.ExternalPlugins[repo][i].Endpoint = fmt.Sprintf("http://%s", p.Name)
 		}
 	}
-	if c.Blunderbuss.ReviewerCount == nil && c.Blunderbuss.FileWeightCount == nil {
+	if c.Blunderbuss.ReviewerCount == nil {
 		c.Blunderbuss.ReviewerCount = new(int)
 		*c.Blunderbuss.ReviewerCount = defaultBlunderbussReviewerCount
 	}
-	for i, trigger := range c.Triggers {
-		if trigger.TrustedOrg == "" || trigger.JoinOrgURL != "" {
-			continue
-		}
-		c.Triggers[i].JoinOrgURL = fmt.Sprintf("https://github.com/orgs/%s/people", trigger.TrustedOrg)
+	for i := range c.Triggers {
+		c.Triggers[i].SetDefaults()
 	}
 	if c.SigMention.Regexp == "" {
 		c.SigMention.Regexp = `(?m)@kubernetes/sig-([\w-]*)-(misc|test-failures|bugs|feature-requests|proposals|pr-reviews|api-reviews)`
@@ -731,11 +905,7 @@ func (c *Configuration) setDefaults() {
 		c.CherryPickUnapproved.BranchRegexp = `^release-.*$`
 	}
 	if c.CherryPickUnapproved.Comment == "" {
-		c.CherryPickUnapproved.Comment = `This PR is not for the master branch but does not have the ` + "`cherry-pick-approved`" + `  label. Adding the ` + "`do-not-merge/cherry-pick-not-approved`" + `  label.
-
-To approve the cherry-pick, please assign the patch release manager for the release branch by writing ` + "`/assign @username`" + ` in a comment when ready.
-
-The list of patch release managers for each release can be found [here](https://git.k8s.io/sig-release/release-managers.md).`
+		c.CherryPickUnapproved.Comment = `This PR is not for the master branch but does not have the ` + "`cherry-pick-approved`" + `  label. Adding the ` + "`do-not-merge/cherry-pick-not-approved`" + `  label.`
 	}
 
 	for i, rml := range c.RequireMatchingLabel {
@@ -745,30 +915,34 @@ The list of patch release managers for each release can be found [here](https://
 	}
 }
 
-// validatePlugins will return error if
-// there are unknown or duplicated plugins.
-func validatePlugins(plugins map[string][]string) error {
-	var errors []string
-	for _, configuration := range plugins {
-		for _, plugin := range configuration {
-			if _, ok := pluginHelp[plugin]; !ok {
-				errors = append(errors, fmt.Sprintf("unknown plugin: %s", plugin))
-			}
-		}
-	}
+// validatePluginsDupes will return an error if there are duplicated plugins.
+// It is sometimes a sign of misconfiguration and is always useless for a
+// plugin to be specified at both the org and repo levels.
+func validatePluginsDupes(plugins map[string][]string) error {
+	var errors []error
 	for repo, repoConfig := range plugins {
 		if strings.Contains(repo, "/") {
 			org := strings.Split(repo, "/")[0]
 			if dupes := findDuplicatedPluginConfig(repoConfig, plugins[org]); len(dupes) > 0 {
-				errors = append(errors, fmt.Sprintf("plugins %v are duplicated for %s and %s", dupes, repo, org))
+				errors = append(errors, fmt.Errorf("plugins %v are duplicated for %s and %s", dupes, repo, org))
 			}
 		}
 	}
+	return utilerrors.NewAggregate(errors)
+}
 
-	if len(errors) > 0 {
-		return fmt.Errorf("invalid plugin configuration:\n\t%v", strings.Join(errors, "\n\t"))
+// ValidatePluginsUnknown will return an error if there are any unrecognized
+// plugins configured.
+func (c *Configuration) ValidatePluginsUnknown() error {
+	var errors []error
+	for _, configuration := range c.Plugins {
+		for _, plugin := range configuration {
+			if _, ok := pluginHelp[plugin]; !ok {
+				errors = append(errors, fmt.Errorf("unknown plugin: %s", plugin))
+			}
+		}
 	}
-	return nil
+	return utilerrors.NewAggregate(errors)
 }
 
 func validateSizes(size Size) error {
@@ -822,45 +996,44 @@ func validateExternalPlugins(pluginMap map[string][]ExternalPlugin) error {
 	return nil
 }
 
-var warnBlunderbussFileWeightCount time.Time
-
 func validateBlunderbuss(b *Blunderbuss) error {
-	if b.ReviewerCount != nil && b.FileWeightCount != nil {
-		return errors.New("cannot use both request_count and file_weight_count in blunderbuss")
-	}
 	if b.ReviewerCount != nil && *b.ReviewerCount < 1 {
 		return fmt.Errorf("invalid request_count: %v (needs to be positive)", *b.ReviewerCount)
-	}
-	if b.FileWeightCount != nil && *b.FileWeightCount < 1 {
-		return fmt.Errorf("invalid file_weight_count: %v (needs to be positive)", *b.FileWeightCount)
-	}
-	if b.FileWeightCount != nil {
-		warnDeprecated(&warnBlunderbussFileWeightCount, 5*time.Minute, "file_weight_count is being deprecated in favour of max_request_count. Please ensure your configuration is updated before the end of May 2019.")
 	}
 	return nil
 }
 
+// ConfigMapID is a name/namespace/cluster combination that identifies a config map
+type ConfigMapID struct {
+	Name, Namespace, Cluster string
+}
+
 func validateConfigUpdater(updater *ConfigUpdater) error {
-	files := sets.NewString()
-	configMapKeys := map[string]sets.String{}
+	updater.SetDefaults()
+	configMapKeys := map[ConfigMapID]sets.String{}
 	for file, config := range updater.Maps {
-		if files.Has(file) {
-			return fmt.Errorf("file %s listed more than once in config updater config", file)
-		}
-		files.Insert(file)
+		for cluster, namespaces := range config.Clusters {
+			for _, namespace := range namespaces {
+				cmID := ConfigMapID{
+					Name:      config.Name,
+					Namespace: namespace,
+					Cluster:   cluster,
+				}
 
-		key := config.Key
-		if key == "" {
-			key = path.Base(file)
-		}
+				key := config.Key
+				if key == "" {
+					key = path.Base(file)
+				}
 
-		if _, ok := configMapKeys[config.Name]; ok {
-			if configMapKeys[config.Name].Has(key) {
-				return fmt.Errorf("key %s in configmap %s updated with more than one file", key, config.Name)
+				if _, ok := configMapKeys[cmID]; ok {
+					if configMapKeys[cmID].Has(key) {
+						return fmt.Errorf("key %s in configmap %s updated with more than one file", key, config.Name)
+					}
+					configMapKeys[cmID].Insert(key)
+				} else {
+					configMapKeys[cmID] = sets.NewString(key)
+				}
 			}
-			configMapKeys[config.Name].Insert(key)
-		} else {
-			configMapKeys[config.Name] = sets.NewString(key)
 		}
 	}
 	return nil
@@ -870,6 +1043,85 @@ func validateRequireMatchingLabel(rs []RequireMatchingLabel) error {
 	for i, r := range rs {
 		if err := r.validate(); err != nil {
 			return fmt.Errorf("error validating require_matching_label config #%d: %v", i, err)
+		}
+	}
+	return nil
+}
+
+func validateProjectManager(pm ProjectManager) error {
+
+	projectConfig := pm
+	// No ProjectManager configuration provided, we have nothing to validate
+	if len(projectConfig.OrgRepos) == 0 {
+		return nil
+	}
+
+	for orgRepoName, managedOrgRepo := range pm.OrgRepos {
+		if len(managedOrgRepo.Projects) == 0 {
+			return fmt.Errorf("Org/repo: %s, has no projects configured", orgRepoName)
+		}
+		for projectName, managedProject := range managedOrgRepo.Projects {
+			var labelSets []sets.String
+			if len(managedProject.Columns) == 0 {
+				return fmt.Errorf("Org/repo: %s, project %s, has no columns configured", orgRepoName, projectName)
+			}
+			for _, managedColumn := range managedProject.Columns {
+				if managedColumn.ID == nil && (len(managedColumn.Name) == 0) {
+					return fmt.Errorf("Org/repo: %s, project %s, column %v, has no name/id configured", orgRepoName, projectName, managedColumn)
+				}
+				if len(managedColumn.Labels) == 0 {
+					return fmt.Errorf("Org/repo: %s, project %s, column %s, has no labels configured", orgRepoName, projectName, managedColumn.Name)
+				}
+				if len(managedColumn.Org) == 0 {
+					return fmt.Errorf("Org/repo: %s, project %s, column %s, has no org configured", orgRepoName, projectName, managedColumn.Name)
+				}
+				sSet := sets.NewString(managedColumn.Labels...)
+				for _, labels := range labelSets {
+					if sSet.Equal(labels) {
+						return fmt.Errorf("Org/repo: %s, project %s, column %s has same labels configured as another column", orgRepoName, projectName, managedColumn.Name)
+					}
+				}
+				labelSets = append(labelSets, sSet)
+			}
+		}
+	}
+	return nil
+}
+
+var warnTriggerTrustedOrg time.Time
+
+func validateTrigger(triggers []Trigger) error {
+	for _, trigger := range triggers {
+		if trigger.TrustedOrg != "" {
+			logrusutil.ThrottledWarnf(&warnTriggerTrustedOrg, 5*time.Minute, "trusted_org functionality is deprecated. Please ensure your configuration is updated before the end of December 2019.")
+		}
+	}
+	return nil
+}
+
+var (
+	warnSlackMergeWarningWhiteList       time.Time
+	warnSlackMergeWarningBranchWhiteList time.Time
+)
+
+func validateSlack(slack Slack) error {
+	for i := range slack.MergeWarnings {
+		if len(slack.MergeWarnings[i].WhiteList) > 0 {
+			if len(slack.MergeWarnings[i].ExemptUsers) > 0 {
+				return errors.New("invalid Slack merge warning configuration: both whitelist (deprecated) and exempt_users are set.")
+			}
+
+			logrusutil.ThrottledWarnf(&warnSlackMergeWarningWhiteList, 5*time.Minute, "whitelist field in Slack merge warning is deprecated and has been renamed to exempt_users. Please update your configuration.")
+			slack.MergeWarnings[i].ExemptUsers = slack.MergeWarnings[i].WhiteList
+		}
+
+		if len(slack.MergeWarnings[i].BranchWhiteList) > 0 {
+			if len(slack.MergeWarnings[i].ExemptBranches) > 0 {
+				return errors.New("invalid Slack merge warning configuration: both branch_whitelist (deprecated) and exempt_branches are set.")
+			}
+
+			logrusutil.ThrottledWarnf(&warnSlackMergeWarningBranchWhiteList, 5*time.Minute, "branch_whitelist field in Slack merge warning is deprecated and has been renamed to exempt_branches. Please update your configuration.")
+			slack.MergeWarnings[i].ExemptBranches = slack.MergeWarnings[i].BranchWhiteList
 		}
 	}
 	return nil
@@ -924,7 +1176,7 @@ func (c *Configuration) Validate() error {
 		return err
 	}
 
-	if err := validatePlugins(c.Plugins); err != nil {
+	if err := validatePluginsDupes(c.Plugins); err != nil {
 		return err
 	}
 	if err := validateExternalPlugins(c.ExternalPlugins); err != nil {
@@ -940,6 +1192,15 @@ func (c *Configuration) Validate() error {
 		return err
 	}
 	if err := validateRequireMatchingLabel(c.RequireMatchingLabel); err != nil {
+		return err
+	}
+	if err := validateProjectManager(c.ProjectManager); err != nil {
+		return err
+	}
+	if err := validateTrigger(c.Triggers); err != nil {
+		return err
+	}
+	if err := validateSlack(c.Slack); err != nil {
 		return err
 	}
 
@@ -988,39 +1249,211 @@ func (pluginConfig *ProjectConfig) GetOrgColumnMap(org string) map[string]string
 type Bugzilla struct {
 	// Default settings mapped by branch in any repo in any org.
 	// The `*` wildcard will apply to all branches.
-	Default map[string]BugzillaBranchOptions `json:"default"`
+	Default map[string]BugzillaBranchOptions `json:"default,omitempty"`
 	// Options for specific orgs. The `*` wildcard will apply to all orgs.
-	Orgs map[string]BugzillaOrgOptions `json:"orgs"`
+	Orgs map[string]BugzillaOrgOptions `json:"orgs,omitempty"`
 }
 
 // BugzillaOrgOptions holds options for checking Bugzilla bugs for an org.
 type BugzillaOrgOptions struct {
 	// Default settings mapped by branch in any repo in this org.
 	// The `*` wildcard will apply to all branches.
-	Default map[string]BugzillaBranchOptions `json:"default"`
+	Default map[string]BugzillaBranchOptions `json:"default,omitempty"`
 	// Options for specific repos. The `*` wildcard will apply to all repos.
-	Repos map[string]BugzillaRepoOptions `json:"repos"`
+	Repos map[string]BugzillaRepoOptions `json:"repos,omitempty"`
 }
 
 // BugzillaRepoOptions holds options for checking Bugzilla bugs for a repo.
 type BugzillaRepoOptions struct {
 	// Options for specific branches in this repo.
 	// The `*` wildcard will apply to all branches.
-	Branches map[string]BugzillaBranchOptions `json:"branches"`
+	Branches map[string]BugzillaBranchOptions `json:"branches,omitempty"`
+}
+
+// BugzillaBugState describes bug states in the Bugzilla plugin config, used
+// for example to specify states that bugs are supposed to be in or to which
+// they should be made after some action.
+type BugzillaBugState struct {
+	Status     string `json:"status,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+}
+
+// String converts a Bugzilla state into human-readable description
+func (s *BugzillaBugState) String() string {
+	return bugzilla.PrettyStatus(s.Status, s.Resolution)
+}
+
+// AsBugUpdate returns a BugUpdate struct for updating a given to bug to the
+// desired state. The returned struct will have only those fields set where the
+// state differs from the parameter bug. If the bug state matches the desired
+// state, returns nil. If the parameter bug is empty or a nil pointer, the
+// returned BugUpdate will have all fields set that are set in the state.
+func (s *BugzillaBugState) AsBugUpdate(bug *bugzilla.Bug) *bugzilla.BugUpdate {
+	if s == nil {
+		return nil
+	}
+
+	var ret *bugzilla.BugUpdate
+	var update bugzilla.BugUpdate
+
+	if s.Status != "" && (bug == nil || s.Status != bug.Status) {
+		ret = &update
+		update.Status = s.Status
+	}
+	if s.Resolution != "" && (bug == nil || s.Resolution != bug.Resolution) {
+		ret = &update
+		update.Resolution = s.Resolution
+	}
+
+	return ret
+}
+
+// Matches returns whether a given bug matches the state
+func (s *BugzillaBugState) Matches(bug *bugzilla.Bug) bool {
+	if s == nil || bug == nil {
+		return false
+	}
+	if s.Status != "" && s.Status != bug.Status {
+		return false
+	}
+
+	if s.Resolution != "" && s.Resolution != bug.Resolution {
+		return false
+	}
+	return true
 }
 
 // BugzillaBranchOptions describes how to check if a Bugzilla bug is valid or not.
+//
+// Note on `Status` vs `State` fields: `State` fields implement a superset of
+// functionality provided by the `Status` fields and are meant to eventually
+// supersede `Status` fields. Implementations using these structures should
+// *only* use `Status` fields or only `States` fields, never both. The
+// implementation mirrors `Status` fields into the matching `State` fields in
+// the `ResolveBugzillaOptions` method to handle existing config, and is also
+// able to sufficiently resolve the presence of both types of fields.
 type BugzillaBranchOptions struct {
-	IsOpen        *bool   `json:"is_open,omitempty"`
+	// ExcludeDefaults excludes defaults from more generic Bugzilla configurations.
+	ExcludeDefaults *bool `json:"exclude_defaults,omitempty"`
+
+	// ValidateByDefault determines whether a validation check is run for all pull
+	// requests by default
+	ValidateByDefault *bool `json:"validate_by_default,omitempty"`
+
+	// IsOpen determines whether a bug needs to be open to be valid
+	IsOpen *bool `json:"is_open,omitempty"`
+	// TargetRelease determines which release a bug needs to target to be valid
 	TargetRelease *string `json:"target_release,omitempty"`
+	// Statuses determine which statuses a bug may have to be valid
+	Statuses *[]string `json:"statuses,omitempty"`
+	// ValidStates determine states in which the bug may be to be valid
+	ValidStates *[]BugzillaBugState `json:"valid_states,omitempty"`
+
+	// DependentBugStatuses determine which statuses a bug's dependent bugs may have
+	// to deem the child bug valid.  These are merged into DependentBugStates when
+	// resolving branch options.
+	DependentBugStatuses *[]string `json:"dependent_bug_statuses,omitempty"`
+	// DependentBugStates determine states in which a bug's dependents bugs may be
+	// to deem the child bug valid.  If set, all blockers must have a valid state.
+	DependentBugStates *[]BugzillaBugState `json:"dependent_bug_states,omitempty"`
+	// DependentBugTargetReleases determines the set of valid target
+	// releases for dependent bugs.  If set, all blockers must have a
+	// valid target release.
+	DependentBugTargetReleases *[]string `json:"dependent_bug_target_releases,omitempty"`
+	// DeprecatedDependentBugTargetRelease determines which release a
+	// bug's dependent bugs need to target to be valid.  If set, all
+	// blockers must have a valid target releasee.
+	//
+	// Deprecated: Use DependentBugTargetReleases instead.  If set,
+	// DependentBugTargetRelease will be appended to
+	// DeprecatedDependentBugTargetReleases.
+	DeprecatedDependentBugTargetRelease *string `json:"dependent_bug_target_release,omitempty"`
+
+	// StatusAfterValidation is the status which the bug will be moved to after being
+	// deemed valid and linked to a PR. Will implicitly be considered a part of `statuses`
+	// if others are set.
+	StatusAfterValidation *string `json:"status_after_validation,omitempty"`
+	// StateAfterValidation is the state to which the bug will be moved after being
+	// deemed valid and linked to a PR. Will implicitly be considered a part of `ValidStates`
+	// if others are set.
+	StateAfterValidation *BugzillaBugState `json:"state_after_validation,omitempty"`
+	// AddExternalLink determines whether the pull request will be added to the Bugzilla
+	// bug using the ExternalBug tracker API after being validated
+	AddExternalLink *bool `json:"add_external_link,omitempty"`
+	// StatusAfterMerge is the status which the bug will be moved to after all pull requests
+	// in the external bug tracker have been merged.
+	StatusAfterMerge *string `json:"status_after_merge,omitempty"`
+	// StateAfterMerge is the state to which the bug will be moved after all pull requests
+	// in the external bug tracker have been merged.
+	StateAfterMerge *BugzillaBugState `json:"state_after_merge,omitempty"`
+	// StateAfterClose is the state to which the bug will be moved if all pull requests
+	// in the external bug tracker have been closed.
+	StateAfterClose *BugzillaBugState `json:"state_after_close,omitempty"`
+
+	// AllowedGroups is a list of bugzilla bug group names that the bugzilla plugin can
+	// link to in PRs. If a bug is part of a group that is not in this list, the bugzilla
+	// plugin will not link the bug to the PR.
+	AllowedGroups []string `json:"allowed_groups,omitempty"`
+}
+
+type BugzillaBugStateSet map[BugzillaBugState]interface{}
+
+func NewBugzillaBugStateSet(states []BugzillaBugState) BugzillaBugStateSet {
+	set := make(BugzillaBugStateSet, len(states))
+	for _, state := range states {
+		set[state] = nil
+	}
+
+	return set
+}
+
+func (s BugzillaBugStateSet) Has(state BugzillaBugState) bool {
+	_, ok := s[state]
+	return ok
+}
+
+func (s BugzillaBugStateSet) Insert(states ...BugzillaBugState) BugzillaBugStateSet {
+	for _, state := range states {
+		s[state] = nil
+	}
+	return s
+}
+
+func statesMatch(first, second []BugzillaBugState) bool {
+	if len(first) != len(second) {
+		return false
+	}
+
+	firstSet := NewBugzillaBugStateSet(first)
+	secondSet := NewBugzillaBugStateSet(second)
+
+	for state := range firstSet {
+		if !secondSet.Has(state) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (o BugzillaBranchOptions) matches(other BugzillaBranchOptions) bool {
+	validateByDefaultMatch := o.ValidateByDefault == nil && other.ValidateByDefault == nil ||
+		(o.ValidateByDefault != nil && other.ValidateByDefault != nil && *o.ValidateByDefault == *other.ValidateByDefault)
 	isOpenMatch := o.IsOpen == nil && other.IsOpen == nil ||
 		(o.IsOpen != nil && other.IsOpen != nil && *o.IsOpen == *other.IsOpen)
 	targetReleaseMatch := o.TargetRelease == nil && other.TargetRelease == nil ||
 		(o.TargetRelease != nil && other.TargetRelease != nil && *o.TargetRelease == *other.TargetRelease)
-	return isOpenMatch && targetReleaseMatch
+	bugStatesMatch := o.ValidStates == nil && other.ValidStates == nil ||
+		(o.ValidStates != nil && other.ValidStates != nil && statesMatch(*o.ValidStates, *other.ValidStates))
+	dependentBugStatesMatch := o.DependentBugStates == nil && other.DependentBugStates == nil ||
+		(o.DependentBugStates != nil && other.DependentBugStates != nil && statesMatch(*o.DependentBugStates, *other.DependentBugStates))
+	statesAfterValidationMatch := o.StateAfterValidation == nil && other.StateAfterValidation == nil ||
+		(o.StateAfterValidation != nil && other.StateAfterValidation != nil && *o.StateAfterValidation == *other.StateAfterValidation)
+	addExternalLinkMatch := o.AddExternalLink == nil && other.AddExternalLink == nil ||
+		(o.AddExternalLink != nil && other.AddExternalLink != nil && *o.AddExternalLink == *other.AddExternalLink)
+	statesAfterMergeMatch := o.StateAfterMerge == nil && other.StateAfterMerge == nil ||
+		(o.StateAfterMerge != nil && other.StateAfterMerge != nil && *o.StateAfterMerge == *other.StateAfterMerge)
+	return validateByDefaultMatch && isOpenMatch && targetReleaseMatch && bugStatesMatch && dependentBugStatesMatch && statesAfterValidationMatch && addExternalLinkMatch && statesAfterMergeMatch
 }
 
 const BugzillaOptionsWildcard = `*`
@@ -1032,26 +1465,177 @@ func OptionsForItem(item string, config map[string]BugzillaBranchOptions) Bugzil
 	return ResolveBugzillaOptions(config[BugzillaOptionsWildcard], config[item])
 }
 
+func mergeStatusesIntoStates(states *[]BugzillaBugState, statuses *[]string) *[]BugzillaBugState {
+	var newStates []BugzillaBugState
+	stateSet := BugzillaBugStateSet{}
+
+	if states != nil {
+		stateSet = stateSet.Insert(*states...)
+	}
+	if statuses != nil {
+		for _, status := range *statuses {
+			stateSet = stateSet.Insert(BugzillaBugState{Status: status})
+		}
+	}
+
+	for state := range stateSet {
+		newStates = append(newStates, state)
+	}
+
+	if len(newStates) > 0 {
+		sort.Slice(newStates, func(i, j int) bool {
+			return newStates[i].Status < newStates[j].Status || (newStates[i].Status == newStates[j].Status && newStates[i].Resolution < newStates[j].Resolution)
+		})
+		return &newStates
+	}
+	return nil
+}
+
 // ResolveBugzillaOptions implements defaulting for a parent/child configuration,
-// preferring child fields where set.
+// preferring child fields where set. This method also reflects all "Status"
+// fields into matching `State` fields.
 func ResolveBugzillaOptions(parent, child BugzillaBranchOptions) BugzillaBranchOptions {
 	output := BugzillaBranchOptions{}
 
-	// populate with the parent
-	if parent.IsOpen != nil {
-		output.IsOpen = parent.IsOpen
-	}
-	if parent.TargetRelease != nil {
-		output.TargetRelease = parent.TargetRelease
+	if child.ExcludeDefaults == nil || !*child.ExcludeDefaults {
+		// populate with the parent
+		if parent.ValidateByDefault != nil {
+			output.ValidateByDefault = parent.ValidateByDefault
+		}
+		if parent.IsOpen != nil {
+			output.IsOpen = parent.IsOpen
+		}
+		if parent.TargetRelease != nil {
+			output.TargetRelease = parent.TargetRelease
+		}
+		if parent.ValidStates != nil {
+			output.ValidStates = parent.ValidStates
+		}
+		if parent.Statuses != nil {
+			output.Statuses = parent.Statuses
+			output.ValidStates = mergeStatusesIntoStates(output.ValidStates, parent.Statuses)
+		}
+		if parent.DependentBugStates != nil {
+			output.DependentBugStates = parent.DependentBugStates
+		}
+		if parent.DependentBugStatuses != nil {
+			output.DependentBugStatuses = parent.DependentBugStatuses
+			output.DependentBugStates = mergeStatusesIntoStates(output.DependentBugStates, parent.DependentBugStatuses)
+		}
+		if parent.DependentBugTargetReleases != nil {
+			output.DependentBugTargetReleases = parent.DependentBugTargetReleases
+		}
+		if parent.DeprecatedDependentBugTargetRelease != nil {
+			logrusutil.ThrottledWarnf(&warnDependentBugTargetRelease, 5*time.Minute, "Please update plugins.yaml to use dependent_bug_target_releases instead of the deprecated dependent_bug_target_release")
+			if parent.DependentBugTargetReleases == nil {
+				output.DependentBugTargetReleases = &[]string{*parent.DeprecatedDependentBugTargetRelease}
+			} else if !sets.NewString(*parent.DependentBugTargetReleases...).Has(*parent.DeprecatedDependentBugTargetRelease) {
+				dependentBugTargetReleases := append(*output.DependentBugTargetReleases, *parent.DeprecatedDependentBugTargetRelease)
+				output.DependentBugTargetReleases = &dependentBugTargetReleases
+			}
+		}
+		if parent.StatusAfterValidation != nil {
+			output.StatusAfterValidation = parent.StatusAfterValidation
+			output.StateAfterValidation = &BugzillaBugState{Status: *output.StatusAfterValidation}
+		}
+		if parent.StateAfterValidation != nil {
+			output.StateAfterValidation = parent.StateAfterValidation
+		}
+		if parent.AddExternalLink != nil {
+			output.AddExternalLink = parent.AddExternalLink
+		}
+		if parent.StatusAfterMerge != nil {
+			output.StatusAfterMerge = parent.StatusAfterMerge
+			output.StateAfterMerge = &BugzillaBugState{Status: *output.StatusAfterMerge}
+		}
+		if parent.StateAfterMerge != nil {
+			output.StateAfterMerge = parent.StateAfterMerge
+		}
+		if parent.StateAfterClose != nil {
+			output.StateAfterClose = parent.StateAfterClose
+		}
+		if parent.AllowedGroups != nil {
+			output.AllowedGroups = sets.NewString(output.AllowedGroups...).Insert(parent.AllowedGroups...).List()
+		}
 	}
 
-	//override with the child
+	// override with the child
+	if child.ValidateByDefault != nil {
+		output.ValidateByDefault = child.ValidateByDefault
+	}
 	if child.IsOpen != nil {
 		output.IsOpen = child.IsOpen
 	}
 	if child.TargetRelease != nil {
 		output.TargetRelease = child.TargetRelease
 	}
+
+	if child.ValidStates != nil {
+		output.ValidStates = child.ValidStates
+	}
+	if child.Statuses != nil {
+		output.Statuses = child.Statuses
+		if child.ValidStates == nil {
+			output.ValidStates = nil
+		}
+		output.ValidStates = mergeStatusesIntoStates(output.ValidStates, child.Statuses)
+	}
+
+	if child.DependentBugStates != nil {
+		output.DependentBugStates = child.DependentBugStates
+	}
+	if child.DependentBugStatuses != nil {
+		output.DependentBugStatuses = child.DependentBugStatuses
+		if child.DependentBugStates == nil {
+			output.DependentBugStates = nil
+		}
+		output.DependentBugStates = mergeStatusesIntoStates(output.DependentBugStates, child.DependentBugStatuses)
+	}
+	if child.DependentBugTargetReleases != nil {
+		output.DependentBugTargetReleases = child.DependentBugTargetReleases
+	}
+	if child.DeprecatedDependentBugTargetRelease != nil {
+		logrusutil.ThrottledWarnf(&warnDependentBugTargetRelease, 5*time.Minute, "Please update plugins.yaml to use dependent_bug_target_releases instead of the deprecated dependent_bug_target_release")
+		if child.DependentBugTargetReleases == nil {
+			output.DependentBugTargetReleases = &[]string{*child.DeprecatedDependentBugTargetRelease}
+		} else if !sets.NewString(*child.DependentBugTargetReleases...).Has(*child.DeprecatedDependentBugTargetRelease) {
+			dependentBugTargetReleases := append(*output.DependentBugTargetReleases, *child.DeprecatedDependentBugTargetRelease)
+			output.DependentBugTargetReleases = &dependentBugTargetReleases
+		}
+	}
+	if child.StatusAfterValidation != nil {
+		output.StatusAfterValidation = child.StatusAfterValidation
+		if child.StateAfterValidation == nil {
+			output.StateAfterValidation = &BugzillaBugState{Status: *child.StatusAfterValidation}
+		}
+	}
+	if child.StateAfterValidation != nil {
+		output.StateAfterValidation = child.StateAfterValidation
+	}
+	if child.AddExternalLink != nil {
+		output.AddExternalLink = child.AddExternalLink
+	}
+	if child.StatusAfterMerge != nil {
+		output.StatusAfterMerge = child.StatusAfterMerge
+		if child.StateAfterMerge == nil {
+			output.StateAfterMerge = &BugzillaBugState{Status: *child.StatusAfterMerge}
+		}
+	}
+	if child.StateAfterMerge != nil {
+		output.StateAfterMerge = child.StateAfterMerge
+	}
+	if child.StateAfterClose != nil {
+		output.StateAfterClose = child.StateAfterClose
+	}
+	if child.AllowedGroups != nil {
+		output.AllowedGroups = sets.NewString(output.AllowedGroups...).Insert(child.AllowedGroups...).List()
+	}
+
+	// Status fields should not be used anywhere now when they were mirrored to states
+	output.Statuses = nil
+	output.DependentBugStatuses = nil
+	output.StatusAfterMerge = nil
+	output.StatusAfterValidation = nil
 
 	return output
 }
@@ -1114,4 +1698,12 @@ func (b *Bugzilla) OptionsForRepo(org, repo string) map[string]BugzillaBranchOpt
 	}
 
 	return options
+}
+
+// Override holds options for the override plugin
+type Override struct {
+	AllowTopLevelOwners bool `json:"allow_top_level_owners,omitempty"`
+	// AllowedGitHubTeams is a map of repositories (eg "k/k") to list of GitHub team slugs,
+	// members of which are allowed to override contexts
+	AllowedGitHubTeams map[string][]string `json:"allowed_github_teams,omitempty"`
 }
